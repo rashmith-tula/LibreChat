@@ -771,18 +771,29 @@ class AgentClient extends BaseClient {
       });
 
       // --- Stored Prompt Pre-Fetch ---
-      // When an agent has both MCP tools and a stored_prompt_id, the stored prompt's
-      // tools (e.g. file_search with vector stores) get overridden by the agent's
-      // explicit tools array. To work around this, we pre-fetch the stored prompt
-      // response via the Responses API (without tools), inject the knowledge base
-      // answer into the agent's messages as context, and then let the agent run
-      // normally with its MCP tools.
+      // When an agent has both explicit tools (e.g. MCP) and a stored_prompt_id,
+      // the stored prompt's tools (e.g. file_search with vector stores) get
+      // overridden by the agent's explicit tools array. To work around this, we
+      // pre-fetch the stored prompt response via the Responses API (without tools),
+      // inject the knowledge base answer into the agent's messages as context,
+      // and then let the agent run normally with its own tools.
+      //
+      // For regular chats without agent tools, the stored prompt is left in
+      // modelKwargs.prompt so it is forwarded directly to the Responses API.
       const storedPromptId =
         this.options.agent.model_parameters?.modelKwargs?.prompt?.id;
-      if (storedPromptId) {
+      const hasAgentTools = toolSet.size > 0;
+      logger.debug(
+        `[AgentClient] Stored prompt check: id=${storedPromptId || 'none'}, hasAgentTools=${hasAgentTools}, toolSetSize=${toolSet.size}`,
+      );
+      if (storedPromptId && hasAgentTools) {
         const apiKey = this.options.agent.model_parameters?.apiKey;
         const model = this.options.agent.model_parameters?.model || 'gpt-5-mini';
-        if (apiKey) {
+        if (!apiKey) {
+          logger.warn(
+            `[AgentClient] No API key found in model_parameters for stored prompt pre-fetch (stored_prompt_id: ${storedPromptId})`,
+          );
+        } else {
           try {
             // Extract the user's latest message text
             const lastMsg = initialMessages[initialMessages.length - 1];
@@ -842,7 +853,7 @@ class AgentClient extends BaseClient {
                 // Reserve 25% of maxContextTokens for the agent's own reasoning
                 // and tool call responses.
                 const existingTokens = Object.values(
-                  this.indexTokenCountMap,
+                  indexTokenCountMap,
                 ).reduce((sum, count) => sum + count, 0);
                 const reserveForAgent = Math.floor(
                   this.maxContextTokens * 0.25,
