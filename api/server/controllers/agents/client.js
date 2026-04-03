@@ -801,6 +801,154 @@ class AgentClient extends BaseClient {
         toolSet,
       );
 
+      // --- Stored Prompt Pre-Fetch ---
+      // When an agent has both MCP tools and a stored_prompt_id, the stored prompt's
+      // tools (e.g. file_search with vector stores) get overridden by the agent's
+      // explicit tools array. To work around this, we pre-fetch the stored prompt
+      // response via the Responses API (without tools), inject the knowledge base
+      // answer into the agent's messages as context, and then let the agent run
+      // normally with its MCP tools.
+      const storedPromptId =
+        this.options.agent.model_parameters?.modelKwargs?.prompt?.id;
+      if (storedPromptId) {
+        const apiKey = this.options.agent.model_parameters?.apiKey;
+        const model = this.options.agent.model_parameters?.model || 'gpt-5-mini';
+        if (apiKey) {
+          try {
+            // Extract the user's latest message text
+            const lastMsg = initialMessages[initialMessages.length - 1];
+            let userQuestion = '';
+            if (lastMsg && lastMsg.content) {
+              if (typeof lastMsg.content === 'string') {
+                userQuestion = lastMsg.content;
+              } else if (Array.isArray(lastMsg.content)) {
+                const textPart = lastMsg.content.find(
+                  (p) => p.type === 'text' || typeof p === 'string',
+                );
+                userQuestion =
+                  typeof textPart === 'string'
+                    ? textPart
+                    : textPart?.text || '';
+              }
+            }
+
+            if (userQuestion) {
+              const OpenAI = require('openai');
+              const openaiClient = new OpenAI({ apiKey });
+              const storedPromptResponse =
+                await openaiClient.responses.create({
+                  model,
+                  input: userQuestion,
+                  prompt: { id: storedPromptId },
+                });
+
+              // Extract the text from the response
+              let storedPromptText = '';
+              if (storedPromptResponse.output) {
+                for (const item of storedPromptResponse.output) {
+                  if (item.type === 'message' && item.content) {
+                    for (const content of item.content) {
+                      if (content.type === 'output_text') {
+                        storedPromptText += content.text;
+                      }
+                    }
+                  }
+                }
+              }
+
+              if (storedPromptText) {
+                // Build the complete message text first, then check token budget.
+                // This ensures the wrapper text (instructions, question) is also
+                // accounted for — not just the KB response body.
+                const buildMessageText = (kbText) =>
+                  `[Knowledge Base Context for "${userQuestion}"]\n\n` +
+                  `${kbText}\n\n` +
+                  `Using the knowledge base context above together with any relevant tool results, provide a consolidated answer to the user's question.`;
+
+                // Minimum token budget required for injecting KB context.
+                // Below this threshold the context would be too short to be useful.
+                const MIN_KB_INJECTION_TOKENS = 200;
+
+                // Calculate remaining token budget.
+                // Reserve 25% of maxContextTokens for the agent's own reasoning
+                // and tool call responses.
+                const existingTokens = Object.values(
+                  this.indexTokenCountMap,
+                ).reduce((sum, count) => sum + count, 0);
+                const reserveForAgent = Math.floor(
+                  this.maxContextTokens * 0.25,
+                );
+                const maxMessageTokens =
+                  this.maxContextTokens - existingTokens - reserveForAgent;
+
+                if (maxMessageTokens > MIN_KB_INJECTION_TOKENS) {
+                  let fullMessageText = buildMessageText(storedPromptText);
+                  const fullTokenCount =
+                    this.getTokenCount(fullMessageText);
+
+                  if (fullTokenCount > maxMessageTokens) {
+                    // Calculate how many tokens the wrapper uses (without KB text)
+                    const wrapperTokens =
+                      this.getTokenCount(buildMessageText(''));
+                    const maxKBTokens = maxMessageTokens - wrapperTokens;
+
+                    // Truncate at sentence boundary to stay within budget.
+                    // Use a rough 4-chars-per-token estimate to find the cut point,
+                    // then walk back to the last sentence-ending punctuation.
+                    const roughCharLimit = Math.max(maxKBTokens * 4, 0);
+                    let truncated = storedPromptText.slice(
+                      0,
+                      roughCharLimit,
+                    );
+                    const lastSentenceEnd = Math.max(
+                      truncated.lastIndexOf('. '),
+                      truncated.lastIndexOf('.\n'),
+                      truncated.lastIndexOf('? '),
+                      truncated.lastIndexOf('! '),
+                    );
+                    if (lastSentenceEnd > roughCharLimit * 0.5) {
+                      truncated = truncated.slice(0, lastSentenceEnd + 1);
+                    }
+                    storedPromptText = truncated + '\n[...truncated]';
+                    fullMessageText = buildMessageText(storedPromptText);
+                    logger.info(
+                      `[AgentClient] Truncated KB message from ${fullTokenCount} to ~${maxMessageTokens} tokens`,
+                    );
+                  }
+
+                  const contextMessage = new HumanMessage(fullMessageText);
+                  initialMessages.push(contextMessage);
+                  logger.info(
+                    `[AgentClient] Pre-fetched stored prompt ${storedPromptId} response for agent`,
+                  );
+                } else {
+                  logger.warn(
+                    `[AgentClient] Insufficient token budget (${maxMessageTokens}) for KB context, skipping injection`,
+                  );
+                }
+              }
+            }
+          } catch (err) {
+            logger.error(
+              `[AgentClient] Failed to pre-fetch stored prompt ${storedPromptId}:`,
+              err,
+            );
+            // Continue without stored prompt context — agent will still work with MCP tools
+          }
+        }
+
+        // Remove the stored prompt from model_parameters so the agent LLM
+        // doesn't also send it (which would cause tools to be overridden again)
+        delete this.options.agent.model_parameters.modelKwargs.prompt;
+        if (
+          this.options.agent.model_parameters.modelKwargs &&
+          Object.keys(this.options.agent.model_parameters.modelKwargs).length === 0
+        ) {
+          delete this.options.agent.model_parameters.modelKwargs;
+        }
+      }
+      // --- End Stored Prompt Pre-Fetch ---
+
       /**
        * @param {BaseMessage[]} messages
        */

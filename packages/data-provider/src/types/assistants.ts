@@ -167,6 +167,7 @@ export type AgentModelParameters = {
   frequency_penalty: AgentParameterValue;
   presence_penalty: AgentParameterValue;
   useResponsesApi?: boolean;
+  stored_prompt_id?: string;
 };
 
 export interface AgentBaseResource {

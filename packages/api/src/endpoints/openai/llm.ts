@@ -274,6 +274,10 @@ export function getOpenAILLMConfig({
      * any tool definitions configured in the Playground.
      * We force `useResponsesApi` here because Chat Completions does not support
      * this parameter.
+     *
+     * Note: In agent flows, stored_prompt_id is handled separately via a pre-fetch
+     * call in the agent client. The stored_prompt_id is extracted from model_parameters
+     * before reaching this function. This code path only runs for regular conversations.
      */
     llmConfig.useResponsesApi = true;
     modelKwargs.prompt = { id: stored_prompt_id };
